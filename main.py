@@ -1,15 +1,4 @@
-# -*- coding: utf-8 -*-
-# %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-#
-# Copyright (c) 2019 Image Processing Research Group of University Federico II of Naples ('GRIP-UNINA').
-# All rights reserved.
-# This work should only be used for nonprofit purposes.
-#
-# By downloading and/or using any of these files, you implicitly agree to all the
-# terms of the license, as specified in the document LICENSE.md
-# (included in this package) and online at
-# http://www.grip.unina.it/download/LICENSE_OPEN.txt
-#
+
 
 import os
 import glob
@@ -58,4 +47,58 @@ if __name__ == '__main__':
 
     print('\nDONE')
     print('OUTPUT: %s' % output_csv)
+
+
+# Restructured training loop
+def train_epoch(model, dataloader, criterion, optimizer, device):
+    """Run one training epoch"""
+    model.train()
+    running_loss = 0.0
+    correct = 0
+    total = 0
+    
+    for inputs, labels in tqdm(dataloader, desc="Training"):
+        inputs, labels = inputs.to(device), labels.to(device)
+        
+        # Zero gradients
+        optimizer.zero_grad()
+        
+        # Forward pass and loss calculation
+        outputs = model(inputs)
+        loss = criterion(outputs, labels)
+        
+        # Backward pass and optimization
+        loss.backward()
+        optimizer.step()
+        
+        # Statistics
+        running_loss += loss.item() * inputs.size(0)
+        _, predicted = outputs.max(1)
+        total += labels.size(0)
+        correct += predicted.eq(labels).sum().item()
+    
+    epoch_loss = running_loss / len(dataloader.dataset)
+    accuracy = 100. * correct / total
+    return epoch_loss, accuracy
+
+# Refactored validation function
+def validate(model, dataloader, criterion, device):
+    """Evaluate model on validation data"""
+    model.eval()
+    val_loss = 0.0
+    correct = 0
+    total = 0
+    
+    with torch.no_grad():
+        for inputs, labels in tqdm(dataloader, desc="Validating"):
+            inputs, labels = inputs.to(device), labels.to(device)
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            
+            val_loss += loss.item() * inputs.size(0)
+            _, predicted = outputs.max(1)
+            total += labels.size(0)
+            correct += predicted.eq(labels).sum().item()
+    
+    return val_loss / len(dataloader.dataset), 100. * correct / total
     

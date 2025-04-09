@@ -1,15 +1,4 @@
-# -*- coding: utf-8 -*-
-# %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-#
-# Copyright (c) 2019 Image Processing Research Group of University Federico II of Naples ('GRIP-UNINA').
-# All rights reserved.
-# This work should only be used for nonprofit purposes.
-#
-# By downloading and/or using any of these files, you implicitly agree to all the
-# terms of the license, as specified in the document LICENSE.md
-# (included in this package) and online at
-# http://www.grip.unina.it/download/LICENSE_OPEN.txt
-#
+
 
 import os, torch
 import glob
@@ -18,6 +7,8 @@ from PIL import Image
 from resnet50nodown import resnet50nodown
 import torch
 import torch.nn.functional as F
+import torch.nn as nn
+import torch.transforms as transforms
 
 if __name__ == '__main__':
     
@@ -53,3 +44,59 @@ if __name__ == '__main__':
 
     # print('\nDONE')
     # print('OUTPUT: %s' % output_csv)
+
+
+class ImagePredictor:
+    """Class for making predictions with trained models"""
+    def __init__(self, model_path=None, device=None):
+        # Initialize with optional model path and device
+        self.device = device if device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = self._initialize_model(model_path)
+        self.transform = self._get_transforms()
+        self.class_names = self._load_class_names()
+    
+    def _initialize_model(self, model_path):
+        """Set up the model with weights"""
+        model = resnet50(pretrained=False)
+        num_ftrs = model.fc.in_features
+        model.fc = nn.Linear(num_ftrs, len(self._load_class_names()))
+        
+        if model_path:
+            model.load_state_dict(torch.load(model_path, map_location=self.device))
+        
+        model = model.to(self.device)
+        model.eval()
+        return model
+    
+    def _get_transforms(self):
+        """Define image transformations"""
+        return transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        ])
+    
+    def predict(self, image_path, top_k=5):
+        """Make prediction on an image"""
+        # Process image
+        img = Image.open(image_path).convert('RGB')
+        img_tensor = self.transform(img).unsqueeze(0).to(self.device)
+        
+        # Get predictions
+        with torch.no_grad():
+            outputs = self.model(img_tensor)
+            probs = F.softmax(outputs, dim=1)
+            
+        # Get top k predictions
+        top_probs, top_indices = probs.topk(top_k)
+        
+        # Convert to list of (class_name, probability) tuples
+        results = []
+        for i in range(top_k):
+            results.append((
+                self.class_names[top_indices[0][i].item()],
+                top_probs[0][i].item()
+            ))
+        
+        return results

@@ -1,204 +1,264 @@
-# -*- coding: utf-8 -*-
-# %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-#
-# Copyright (c) 2019 Image Processing Research Group of University Federico II of Naples ('GRIP-UNINA').
-# All rights reserved.
-# This work should only be used for nonprofit purposes.
-#
-# By downloading and/or using any of these files, you implicitly agree to all the
-# terms of the license, as specified in the document LICENSE.md
-# (included in this package) and online at
-# http://www.grip.unina.it/download/LICENSE_OPEN.txt
-#
+
 
 import torch
 import torch.nn as nn
 import torchvision.transforms as transforms
-LIMIT_SIZE  = 1536
-LIMIT_SLIDE = 1024
 
-class ChannelLinear(nn.Linear):
+# Constants for image size limitations
+MAX_IMAGE_DIM = 1536
+PROCESSING_CHUNK = 1024
 
-    def __init__(self, in_features: int, out_features: int, bias: bool = True) -> None:
-        super(ChannelLinear, self).__init__(in_features, out_features, bias)
+class LinearAcrossChannels(nn.Linear):
+    """Custom linear layer that operates across channels"""
+    
+    def __init__(self, input_features: int, output_features: int, use_bias: bool = True) -> None:
+        super(LinearAcrossChannels, self).__init__(input_features, output_features, use_bias)
 
-    def forward(self, x):
-        out_shape = [x.shape[0], x.shape[2], x.shape[3], self.out_features]
-        x = x.permute(0,2,3,1).reshape(-1,self.in_features)
-        x = x.matmul(self.weight.t())
+    def forward(self, tensor):
+        # Reshape for matrix multiplication
+        output_dimensions = [tensor.shape[0], tensor.shape[2], tensor.shape[3], self.out_features]
+        reshaped = tensor.permute(0, 2, 3, 1).reshape(-1, self.in_features)
+        
+        # Apply linear transformation
+        transformed = reshaped.matmul(self.weight.t())
         if self.bias is not None:
-            x = x + self.bias[None,:]
-        x = x.view(out_shape).permute(0,3,1,2)
-        return x
+            transformed = transformed + self.bias[None, :]
+            
+        # Reshape back to original format
+        result = transformed.view(output_dimensions).permute(0, 3, 1, 2)
+        return result
 
     
-def conv3x3(in_planes, out_planes, stride=1):
-    """3x3 convolution with padding"""
-    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride, padding=1, bias=False)
+def create_3x3_conv(in_channels, out_channels, stride=1):
+    """Creates a 3x3 convolution with padding"""
+    return nn.Conv2d(
+        in_channels=in_channels, 
+        out_channels=out_channels, 
+        kernel_size=3, 
+        stride=stride, 
+        padding=1, 
+        bias=False
+    )
 
-def conv1x1(in_planes, out_planes, stride=1):
-    """1x1 convolution"""
-    return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False)
+def create_1x1_conv(in_channels, out_channels, stride=1):
+    """Creates a 1x1 convolution"""
+    return nn.Conv2d(
+        in_channels=in_channels, 
+        out_channels=out_channels, 
+        kernel_size=1, 
+        stride=stride, 
+        bias=False
+    )
 
-class Bottleneck(nn.Module):
-    expansion = 4
+class ResidualBlock(nn.Module):
+    """Bottleneck block for ResNet"""
+    expansion_factor = 4
 
-    def __init__(self, inplanes, planes, stride=1, downsample=None):
-        super(Bottleneck, self).__init__()
-        self.conv1 = conv1x1(inplanes, planes)
-        self.bn1 = nn.BatchNorm2d(planes)
-        self.conv2 = conv3x3(planes, planes, stride)
-        self.bn2 = nn.BatchNorm2d(planes)
-        self.conv3 = conv1x1(planes, planes * self.expansion)
-        self.bn3 = nn.BatchNorm2d(planes * self.expansion)
-        self.relu = nn.ReLU(inplace=True)
-        self.downsample = downsample
-        self.stride = stride
+    def __init__(self, input_channels, internal_channels, stride=1, shortcut=None):
+        super(ResidualBlock, self).__init__()
+        
+        # First 1x1 convolution to reduce channels
+        self.reduction_block = nn.Sequential(
+            create_1x1_conv(input_channels, internal_channels),
+            nn.BatchNorm2d(internal_channels),
+            nn.ReLU(inplace=True)
+        )
+        
+        # 3x3 convolution for spatial processing
+        self.spatial_block = nn.Sequential(
+            create_3x3_conv(internal_channels, internal_channels, stride),
+            nn.BatchNorm2d(internal_channels),
+            nn.ReLU(inplace=True)
+        )
+        
+        # Final 1x1 convolution to expand channels
+        self.expansion_block = nn.Sequential(
+            create_1x1_conv(internal_channels, internal_channels * self.expansion_factor),
+            nn.BatchNorm2d(internal_channels * self.expansion_factor)
+        )
+        
+        self.shortcut = shortcut
+        self.activation = nn.ReLU(inplace=True)
 
     def forward(self, x):
-        identity = x
+        residual = x
 
-        out = self.conv1(x)
-        out = self.bn1(out)
-        out = self.relu(out)
+        # Process through the three blocks
+        out = self.reduction_block(x)
+        out = self.spatial_block(out)
+        out = self.expansion_block(out)
 
-        out = self.conv2(out)
-        out = self.bn2(out)
-        out = self.relu(out)
+        # Apply shortcut connection if needed
+        if self.shortcut is not None:
+            residual = self.shortcut(x)
 
-        out = self.conv3(out)
-        out = self.bn3(out)
-
-        if self.downsample is not None:
-            identity = self.downsample(x)
-
-        out += identity
-        out = self.relu(out)
+        # Add residual connection and apply activation
+        out += residual
+        out = self.activation(out)
 
         return out
 
 
-class ResNet(nn.Module):
+class EnhancedResNet(nn.Module):
+    """ResNet architecture with customizable parameters"""
 
-    def __init__(self, block, layers, num_classes=1, stride0=2):
-        super(ResNet, self).__init__()
-        self.inplanes = 64
+    def __init__(self, block_type, block_counts, output_classes=1, initial_stride=2):
+        super(EnhancedResNet, self).__init__()
+        self.current_channels = 64
         
-        self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=stride0, padding=3, bias=False)
-        self.bn1 = nn.BatchNorm2d(64)
-        self.relu = nn.ReLU(inplace=True)
-        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=stride0, padding=1)
-        self.layer1 = self._make_layer(block, 64, layers[0])
-        self.layer2 = self._make_layer(block, 128, layers[1], stride=2)
-        self.layer3 = self._make_layer(block, 256, layers[2], stride=2)
-        self.layer4 = self._make_layer(block, 512, layers[3], stride=2)
+        # Initial processing block
+        self.entry_block = nn.Sequential(
+            nn.Conv2d(3, 64, kernel_size=7, stride=initial_stride, padding=3, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=3, stride=initial_stride, padding=1)
+        )
+        
+        # Residual blocks
+        self.stage1 = self._construct_stage(block_type, 64, block_counts[0])
+        self.stage2 = self._construct_stage(block_type, 128, block_counts[1], stride=2)
+        self.stage3 = self._construct_stage(block_type, 256, block_counts[2], stride=2)
+        self.stage4 = self._construct_stage(block_type, 512, block_counts[3], stride=2)
 
-        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-        self.num_features = 512 * block.expansion
-        self.fc = ChannelLinear(self.num_features, num_classes)
+        # Output block
+        self.global_pooling = nn.AdaptiveAvgPool2d((1, 1))
+        self.feature_dimension = 512 * block_type.expansion_factor
+        self.classifier = LinearAcrossChannels(self.feature_dimension, output_classes)
 
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-            elif isinstance(m, nn.BatchNorm2d):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
+        # Initialize weights
+        self._initialize_parameters()
 
-        # transform form Pillow
-        self.transform = transforms.Compose([transforms.ToTensor(),
-                                             transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                             std=[0.229, 0.224, 0.225])])
+        # Image transformation pipeline
+        self.preprocessing = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225]
+            )
+        ])
 
+    def _initialize_parameters(self):
+        """Initialize model parameters"""
+        for module in self.modules():
+            if isinstance(module, nn.Conv2d):
+                nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(module, nn.BatchNorm2d):
+                nn.init.constant_(module.weight, 1)
+                nn.init.constant_(module.bias, 0)
 
-
-    def _make_layer(self, block, planes, blocks, stride=1):
-        downsample = None
-        if stride != 1 or self.inplanes != planes * block.expansion:
-            downsample = nn.Sequential(
-                conv1x1(self.inplanes, planes * block.expansion, stride),
-                nn.BatchNorm2d(planes * block.expansion),
+    def _construct_stage(self, block_type, channels, num_blocks, stride=1):
+        """Construct a stage of the network with multiple residual blocks"""
+        shortcut = None
+        if stride != 1 or self.current_channels != channels * block_type.expansion_factor:
+            shortcut = nn.Sequential(
+                create_1x1_conv(self.current_channels, channels * block_type.expansion_factor, stride),
+                nn.BatchNorm2d(channels * block_type.expansion_factor),
             )
 
         layers = []
-        layers.append(block(self.inplanes, planes, stride, downsample))
-        self.inplanes = planes * block.expansion
-        for _ in range(1, blocks):
-            layers.append(block(self.inplanes, planes))
+        # First block may have a stride and shortcut
+        layers.append(block_type(self.current_channels, channels, stride, shortcut))
+        
+        # Update channel count for subsequent blocks
+        self.current_channels = channels * block_type.expansion_factor
+        
+        # Add remaining blocks
+        for _ in range(1, num_blocks):
+            layers.append(block_type(self.current_channels, channels))
 
         return nn.Sequential(*layers)
 
-    def change_output(self, num_classes):
-        self.fc = ChannelLinear(self.num_features, num_classes)
-        torch.nn.init.normal_(self.fc.weight.data, 0.0, 0.02)
+    def update_output_layer(self, output_classes):
+        """Change the number of output classes"""
+        self.classifier = LinearAcrossChannels(self.feature_dimension, output_classes)
+        torch.nn.init.normal_(self.classifier.weight.data, 0.0, 0.02)
         return self
         
-    def change_input(self, num_inputs):
-        data = self.conv1.weight.data
-        old_num_inputs = int(data.shape[1])
-        if num_inputs>old_num_inputs:
-            times = num_inputs//old_num_inputs
-            if (times*old_num_inputs)<num_inputs:
-                times = times+1
-            data = data.repeat(1,times,1,1) / times
-        elif num_inputs==old_num_inputs:
+    def modify_input_channels(self, num_channels):
+        """Change the number of input channels"""
+        current_weights = self.entry_block[0].weight.data
+        original_channels = int(current_weights.shape[1])
+        
+        if num_channels > original_channels:
+            # Repeat weights to match new channel count
+            repetitions = num_channels // original_channels
+            if (repetitions * original_channels) < num_channels:
+                repetitions += 1
+            new_weights = current_weights.repeat(1, repetitions, 1, 1) / repetitions
+        elif num_channels == original_channels:
             return self
         
-        data = data[:,:num_inputs,:,:]
-        print(self.conv1.weight.data.shape, '->', data.shape)
-        self.conv1.weight.data = data
+        # Slice to get exact number of channels
+        new_weights = new_weights[:, :num_channels, :, :]
+        print(self.entry_block[0].weight.data.shape, '->', new_weights.shape)
+        self.entry_block[0].weight.data = new_weights
         
         return self
     
-    def feature(self, x):
-        x = self.conv1(x)
-        x = self.bn1(x)
-        x = self.relu(x)
-        x = self.maxpool(x)
-
-        x = self.layer1(x)
-        x = self.layer2(x)
-        x = self.layer3(x)
-        x = self.layer4(x)
+    def extract_features(self, x):
+        """Extract features without classification"""
+        x = self.entry_block(x)
+        x = self.stage1(x)
+        x = self.stage2(x)
+        x = self.stage3(x)
+        x = self.stage4(x)
         return x
     
     def forward(self, x):
-        x = self.feature(x)
-        x = self.avgpool(x)
-        x = self.fc(x)
-
+        """Forward pass through the network"""
+        x = self.extract_features(x)
+        x = self.global_pooling(x)
+        x = self.classifier(x)
         return x
             
-    def apply(self, pil):
-        device = self.conv1.weight.device
-        if (pil.size[0]>LIMIT_SIZE) and (pil.size[1]>LIMIT_SIZE):
-            import numpy as np
-            print('err:', pil.size)
-            with torch.no_grad():
-                img = self.transform(pil)
-                list_logit  = list()
-                list_weight = list()
-                for index0 in range(0, img.shape[-2], LIMIT_SLIDE):
-                    for index1 in range(0, img.shape[-1], LIMIT_SLIDE):
-                        clip = img[..., index0:min(index0+LIMIT_SLIDE,  img.shape[-2]),
-                                        index1:min(index1+LIMIT_SLIDE,  img.shape[-1])]
-                        logit  = torch.squeeze(self(clip.to(device)[None,:,:,:])).cpu().numpy()
-                        weight = clip.shape[-2] * clip.shape[-1]
-                        list_logit.append(logit)
-                        list_weight.append(weight)
-            
-            logit = np.mean(np.asarray(list_logit) * np.asarray(list_weight)) / np.mean(list_weight)
-        else:
-            with torch.no_grad():
-                logit = torch.squeeze(self(self.transform(pil).to(device)[None,:,:,:])).cpu().numpy()
+    def process_image(self, pil_image):
+        """Process a PIL image through the model"""
+        device = self.entry_block[0].weight.device
         
-        return logit
+        # Handle large images by processing in chunks
+        if (pil_image.size[0] > MAX_IMAGE_DIM) and (pil_image.size[1] > MAX_IMAGE_DIM):
+            import numpy as np
+            print('Processing large image:', pil_image.size)
+            
+            with torch.no_grad():
+                img = self.preprocessing(pil_image)
+                predictions = []
+                weights = []
+                
+                # Process image in chunks
+                for y_pos in range(0, img.shape[-2], PROCESSING_CHUNK):
+                    for x_pos in range(0, img.shape[-1], PROCESSING_CHUNK):
+                        # Extract chunk
+                        chunk = img[..., 
+                                    y_pos:min(y_pos + PROCESSING_CHUNK, img.shape[-2]),
+                                    x_pos:min(x_pos + PROCESSING_CHUNK, img.shape[-1])]
+                        
+                        # Process chunk
+                        pred = torch.squeeze(self(chunk.to(device)[None, :, :, :])).cpu().numpy()
+                        weight = chunk.shape[-2] * chunk.shape[-1]  # Weight by area
+                        
+                        predictions.append(pred)
+                        weights.append(weight)
+            
+            # Weighted average of predictions
+            final_prediction = np.mean(np.asarray(predictions) * np.asarray(weights)) / np.mean(weights)
+        else:
+            # Process normal-sized image
+            with torch.no_grad():
+                final_prediction = torch.squeeze(
+                    self(self.preprocessing(pil_image).to(device)[None, :, :, :])
+                ).cpu().numpy()
+        
+        return final_prediction
 
-def resnet50nodown(device, filename, num_classes=1):
-    """Constructs a ResNet-50 nodown model.
-    """
-    model = ResNet(Bottleneck, [3, 4, 6, 3], num_classes=num_classes, stride0=1)
-    model.load_state_dict(torch.load(filename, map_location=torch.device('cpu'))['model'])
+def create_resnet50_no_downsampling(device, weights_file, num_classes=1):
+    """Create a ResNet-50 model without initial downsampling"""
+    model = EnhancedResNet(ResidualBlock, [3, 4, 6, 3], output_classes=num_classes, initial_stride=1)
+    model.load_state_dict(torch.load(weights_file, map_location=torch.device('cpu'))['model'])
     model = model.to(device).eval()
     return model
+
+# For backward compatibility
+resnet50nodown = create_resnet50_no_downsampling
 
 
