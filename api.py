@@ -6,7 +6,7 @@ import io
 from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import JSONResponse
 from PIL import Image
-from resnet50nodown import resnet50nodown, EnhancedResNet, ResidualBlock
+from deepfake_model import resnet50nodown, EnhancedResNet, ResidualBlock
 
 app = FastAPI()
 
